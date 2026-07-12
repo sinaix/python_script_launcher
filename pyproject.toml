@@ -1,0 +1,61 @@
+# pyproject.toml
+#
+# Two roles:
+#   1) Local development (uv sync / pip install -e .): declares runtime deps.
+#   2) Wheel/sdist publishing: `python publish.py --wheel` stages a
+#      `python_script_launcher/` package into a temp tree and writes a
+#      dedicated pyproject.toml there before invoking `python -m build`.
+#      This file itself does NOT ship a wheel.
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-script-launcher"
+description = "Package Python scripts into standalone executables (Web UI + desktop client)."
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+authors = [{ name = "pyRunner" }]
+keywords = ["pyinstaller", "packaging", "exe", "launcher", "scripts"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+]
+
+dependencies = [
+    "fastapi>=0.100.0",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.20.0",
+    "requests>=2.34.2",
+]
+
+[project.optional-dependencies]
+desktop = ["pywebview>=4.0"]
+build = ["pyinstaller>=6.0", "build>=1.0"]
+all = ["pywebview>=4.0", "pyinstaller>=6.0", "build>=1.0"]
+
+# Version comes from the VERSION file so publish.py is the single source of truth.
+[tool.setuptools.dynamic]
+version = { file = ["VERSION"] }
+
+# No wheel is emitted from this tree; publish.py builds it from a staged
+# `python_script_launcher/` layout. Keep setuptools happy by declaring an
+# empty package set here.
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["__nonexistent__"]
+
+# uv-only: pin the Tsinghua mirror as the default index for local sync.
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+default = true
