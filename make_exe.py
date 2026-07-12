@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from importlib.metadata import distributions
 from pathlib import Path
 
@@ -36,6 +37,14 @@ SKIP_PACKAGES = {
     "pyproject-hooks", "packaging",
     "python-script-launcher",
 }
+
+# Files copied into the on-the-fly `python_script_launcher/` package so user
+# scripts can `from python_script_launcher.tasks import task` inside the
+# frozen exe (mirrors publish.py's wheel layout).
+_STAGE_PACKAGE_FILES = (
+    "app.py", "client.py", "tasks.py", "__init__.py", "__main__.py",
+)
+_STAGE_PACKAGE_NAME = "python_script_launcher"
 
 
 def _norm(name: str) -> str:
@@ -73,6 +82,23 @@ def _clean_target(name: str, dist_dir: Path, build_dir: Path, project: Path,
             p.unlink()
         elif p.is_dir():
             shutil.rmtree(p, ignore_errors=True)
+
+
+def _stage_launcher_package(project: Path) -> Path:
+    """Materialize a temporary `python_script_launcher/` package next to the
+    top-level source files so PyInstaller can pick it up via `--paths`.
+
+    Returns the *root* directory to add to PyInstaller search paths; the
+    caller is responsible for removing it once the build is done.
+    """
+    stage_root = Path(tempfile.mkdtemp(prefix="psl-exe-"))
+    pkg_dir = stage_root / _STAGE_PACKAGE_NAME
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    for name in _STAGE_PACKAGE_FILES:
+        src = project / name
+        if src.exists():
+            shutil.copy2(src, pkg_dir / name)
+    return stage_root
 
 
 def build_exe(entry, name, *, project=None, dist=None, static=None,
@@ -128,31 +154,50 @@ def build_exe(entry, name, *, project=None, dist=None, static=None,
     if scripts_dir.exists():
         cmd += ["--add-data", f"{scripts_dir}{os.pathsep}scripts"]
 
-    # Make `tasks` and the compatibility `python_script_launcher` shim
-    # importable from user scripts inside the frozen exe. `--paths` lets
-    # PyInstaller resolve them at build time; hidden-imports pull them into
-    # the frozen PYZ.
-    cmd += ["--paths", str(project)]
-    if (project / "tasks.py").exists():
-        cmd += ["--hidden-import", "tasks"]
+    # Make both `tasks` (top-level) and `python_script_launcher.tasks`
+    # (wheel-style dotted import) usable from user scripts inside the exe.
+    # - `--paths <project>` lets `from tasks import task` resolve.
+    # - We also stage a temporary `python_script_launcher/` package that
+    #   mirrors publish.py wheel layout and add its parent to `--paths`, so
+    #   `from python_script_launcher.tasks import task` resolves the same
+    #   way it does when installed from the wheel.
+    # If the caller already staged a python_script_launcher/ package into
+    # `project` (e.g. via __main__.cmd_build), reuse it verbatim so we do
+    # not end up with two competing copies of the same package on --paths.
     if (project / "python_script_launcher" / "__init__.py").exists():
-        cmd += ["--hidden-import", "python_script_launcher"]
+        stage_root = None
+    else:
+        stage_root = _stage_launcher_package(project)
+    try:
+        cmd += ["--paths", str(project)]
+        if stage_root is not None:
+            cmd += ["--paths", str(stage_root)]
+        if (project / "tasks.py").exists():
+            cmd += ["--hidden-import", "tasks"]
+        cmd += [
+            "--hidden-import", _STAGE_PACKAGE_NAME,
+            "--hidden-import", f"{_STAGE_PACKAGE_NAME}.tasks",
+            "--collect-submodules", _STAGE_PACKAGE_NAME,
+        ]
 
-    for pkg in get_installed_packages():
-        cmd += ["--collect-all", pkg]
+        for pkg in get_installed_packages():
+            cmd += ["--collect-all", pkg]
 
-    if icon_arg:
-        cmd += ["--icon", icon_arg]
+        if icon_arg:
+            cmd += ["--icon", icon_arg]
 
-    entry_path = Path(entry)
-    if not entry_path.is_absolute():
-        entry_path = (project / entry_path).resolve()
-    cmd.append(str(entry_path))
+        entry_path = Path(entry)
+        if not entry_path.is_absolute():
+            entry_path = (project / entry_path).resolve()
+        cmd.append(str(entry_path))
 
-    print(f"  entry: {entry_path}")
-    subprocess.run(cmd, check=True, cwd=str(project))
-    out = f"{dist_dir}/{name}.exe" if onefile else f"{dist_dir}/{name}/{name}.exe"
-    print(f"  [OK] {name} -> {out}\n")
+        print(f"  entry: {entry_path}")
+        subprocess.run(cmd, check=True, cwd=str(project))
+        out = f"{dist_dir}/{name}.exe" if onefile else f"{dist_dir}/{name}/{name}.exe"
+        print(f"  [OK] {name} -> {out}\n")
+    finally:
+        if stage_root is not None:
+            shutil.rmtree(stage_root, ignore_errors=True)
 
 
 def main():

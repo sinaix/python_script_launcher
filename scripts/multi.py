@@ -1,4 +1,4 @@
-"""多任务示例: 用 @task 注册多个可运行函数, 无需 __main__ guard."""
+"""Multi-task demo using the wheel-style dotted import."""
 from tasks import task
 
 

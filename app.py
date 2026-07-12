@@ -42,13 +42,35 @@ def _default_root():
     return p.parent if p.name == "scripts" else p
 
 
+# The launcher package always ships a `static/` folder next to app.py
+# (repo root during development, python_script_launcher/ after wheel
+# install). Remember it so `run --scripts <dir>` and `build --scripts
+# <dir>` can serve the frontend even when <dir> has no static/ of its own.
+_LAUNCHER_DIR = Path(__file__).parent.resolve()
+
+
 def _default_static(root: Path):
+    """Resolve the default static directory.
+
+    Search order:
+        1. sys._MEIPASS/static (PyInstaller frozen bundle),
+        2. <launcher package>/static (source repo or wheel install),
+        3. <user scripts root>/static (lets users override the UI).
+
+    Returns the first existing candidate, falling back to the last one
+    for backward compatibility when nothing is on disk yet.
+    """
+    candidates = []
     if getattr(sys, "frozen", False):
-        meipass = Path(sys._MEIPASS)
-        static = meipass / "static"
-        if static.exists():
-            return static
-    return root / "static"
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidates.append(Path(meipass) / "static")
+    candidates.append(_LAUNCHER_DIR / "static")
+    candidates.append(root / "static")
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[-1]
 
 
 DEFAULT_ROOT = _default_root()
@@ -622,6 +644,7 @@ def create_app(
             candidates.append(Path(sys._MEIPASS) / "static" / "index.html")
         candidates.extend([
             static / "index.html",
+            _LAUNCHER_DIR / "static" / "index.html",
             project_root / "static" / "index.html",
         ])
         for f in candidates:
