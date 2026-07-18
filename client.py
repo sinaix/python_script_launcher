@@ -50,6 +50,17 @@ def start_desktop(
             r = w.create_file_dialog(webview.FOLDER_DIALOG)
             return r[0] if r else None
 
+        def pick_files(self, multiple=True):
+            """原生文件选择器，返回文件绝对路径列表 (取消时为 [])。"""
+            w = webview.windows[0]
+            r = w.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=bool(multiple),
+            )
+            if not r:
+                return []
+            return [str(Path(x).resolve()) for x in r]
+
         def open_folder(self, path=None):
             import subprocess
             target = str(Path(path) if path else project_root)

@@ -34,6 +34,8 @@ dependencies = [
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.20.0",
     "requests>=2.34.2",
+    "pyinstaller>=6.0",
+    "pywebview>=4.0",
 ]
 
 [project.optional-dependencies]

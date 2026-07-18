@@ -341,7 +341,81 @@ class _LineWriter:
         return False
 
 
-async def _run_script_stream(script_path: Path, args_list: list):
+# 正在运行的脚本会话: session_id -> {'stdin_q': queue.Queue | None,
+#                                    'proc': asyncio subprocess | None}
+# /api/input 通过 session_id 找到目标, 向 stdin 投递用户输入。
+_RUN_SESSIONS: dict = {}
+
+
+class _StdinReader:
+    """进程内脚本用的可阻塞 stdin。
+
+    readline() 会先 flush 当前 stdout/stderr, 让 input("prompt: ")
+    的提示先冲刷到前端, 再阻塞等一整行; put(None) 视为 EOF。
+    """
+
+    def __init__(self, q):
+        self._q = q
+        self._buf = ""
+        self._eof = False
+
+    def _flush_out(self):
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def readline(self, size=-1):
+        self._flush_out()
+        while "\n" not in self._buf and not self._eof:
+            chunk = self._q.get()
+            if chunk is None:
+                self._eof = True
+                break
+            self._buf += chunk
+        if "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            return line + "\n"
+        line, self._buf = self._buf, ""
+        return line
+
+    def read(self, size=-1):
+        self._flush_out()
+        if size is None or size < 0:
+            parts = []
+            while not self._eof:
+                chunk = self._q.get()
+                if chunk is None:
+                    self._eof = True
+                    break
+                parts.append(chunk)
+            data = self._buf + "".join(parts)
+            self._buf = ""
+            return data
+        while len(self._buf) < size and not self._eof:
+            chunk = self._q.get()
+            if chunk is None:
+                self._eof = True
+                break
+            self._buf += chunk
+        data, self._buf = self._buf[:size], self._buf[size:]
+        return data
+
+    def isatty(self):
+        return False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+
+async def _run_script_stream(script_path: Path, args_list: list, stdin_q=None):
     """在后台线程里以 runpy 方式执行脚本, 异步 yield ("OUT"/"ERR"/"EXIT", value).
 
     - 避免 exe 内启动子 python 进程（frozen 下每次会重新解包/加载依赖, 耗时数秒）。
@@ -355,7 +429,7 @@ async def _run_script_stream(script_path: Path, args_list: list):
     sentinel = object()
 
     def worker():
-        old_stdout, old_stderr = sys.stdout, sys.stderr
+        old_stdout, old_stderr, old_stdin = sys.stdout, sys.stderr, sys.stdin
         old_argv = sys.argv
         script_dir = str(script_path.parent.resolve())
         added_path = script_dir not in sys.path
@@ -365,6 +439,8 @@ async def _run_script_stream(script_path: Path, args_list: list):
         try:
             sys.stdout = _LineWriter(out_queue, "OUT")
             sys.stderr = _LineWriter(out_queue, "ERR")
+            if stdin_q is not None:
+                sys.stdin = _StdinReader(stdin_q)
             sys.argv = [str(script_path)] + list(args_list)
             try:
                 runpy.run_path(str(script_path), run_name="__main__")
@@ -381,7 +457,7 @@ async def _run_script_stream(script_path: Path, args_list: list):
                 except Exception:
                     pass
         finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
+            sys.stdout, sys.stderr, sys.stdin = old_stdout, old_stderr, old_stdin
             sys.argv = old_argv
             if added_path:
                 try:
@@ -430,7 +506,7 @@ def _coerce_task_kwargs(spec_obj, raw: dict) -> dict:
     return coerced
 
 
-async def _run_task_stream(script_path: Path, task_name: str, kwargs: dict):
+async def _run_task_stream(script_path: Path, task_name: str, kwargs: dict, stdin_q=None):
     """Import a script module and call its @task-registered function in-thread.
 
     Yields ("OUT" | "ERR" | "EXIT", value) tuples, same shape as
@@ -445,7 +521,7 @@ async def _run_task_stream(script_path: Path, task_name: str, kwargs: dict):
     sentinel = object()
 
     def worker():
-        old_stdout, old_stderr = sys.stdout, sys.stderr
+        old_stdout, old_stderr, old_stdin = sys.stdout, sys.stderr, sys.stdin
         script_dir = str(script_path.parent.resolve())
         added_path = script_dir not in sys.path
         if added_path:
@@ -454,6 +530,8 @@ async def _run_task_stream(script_path: Path, task_name: str, kwargs: dict):
         try:
             sys.stdout = _LineWriter(out_queue, "OUT")
             sys.stderr = _LineWriter(out_queue, "ERR")
+            if stdin_q is not None:
+                sys.stdin = _StdinReader(stdin_q)
             module_name = f"_launcher_task_{script_path.stem}"
             try:
                 spec = importlib.util.spec_from_file_location(module_name, str(script_path))
@@ -478,7 +556,7 @@ async def _run_task_stream(script_path: Path, task_name: str, kwargs: dict):
                 except Exception:
                     pass
         finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
+            sys.stdout, sys.stderr, sys.stdin = old_stdout, old_stderr, old_stdin
             if added_path:
                 try:
                     sys.path.remove(script_dir)
@@ -521,7 +599,7 @@ def create_app(
     project_root = Path(root).resolve() if root else DEFAULT_ROOT
     static = Path(static_dir).resolve() if static_dir else _default_static(project_root)
     uploads = Path(uploads_dir).resolve() if uploads_dir else project_root / "_uploads"
-    uploads.mkdir(parents=True, exist_ok=True)
+    # _uploads/ 只在浏览器拖入无路径时作为回落写入，按需 mkdir。
 
     python_bin = find_python(project_root)
     app = FastAPI(title="Python App Launcher")
@@ -533,19 +611,61 @@ def create_app(
         return {"root": str(scan_root), "scripts": [s.to_dict() for s in scripts.values()]}
 
     @app.post("/api/upload")
-    async def upload_file(file: UploadFile = File(...)):
-        file_id = f"{uuid.uuid4().hex[:12]}_{file.filename}"
-        dest = uploads / file_id
+    async def upload_passthrough(file: UploadFile = File(...)):
+        """浏览器拖入无法暴露原始路径时的回落：保存到 _uploads/ 并返回绝对路径。
+
+        点击选择走 /api/pick-files 零拷贝；只有拖入才会命中这里。
+        """
+        uploads.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(file.filename or "dropped.bin").name
+        dest = uploads / f"{uuid.uuid4().hex[:12]}_{safe_name}"
         with open(dest, "wb") as f:
-            content = await file.read()
-            f.write(content)
-        return {"file_id": file_id, "filename": file.filename, "size": len(content)}
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        return {"path": str(dest.resolve()), "filename": safe_name}
+
+    @app.post("/api/pick-files")
+    async def pick_files(multiple: str = Form("1"), title: str = Form("Select file(s)")):
+        """弹出本地文件选择对话框，返回文件的绝对路径列表（不复制）。
+
+        浏览器模式下由服务端通过 tkinter 弹窗；桌面客户端 (client.py) 会在
+        pywebview 的 js_api 中覆盖同名方法，走原生对话框。
+        """
+        loop = asyncio.get_event_loop()
+
+        def _open_dialog():
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+            except Exception as e:
+                return {"error": f"tkinter unavailable: {e}", "paths": []}
+            root_win = tk.Tk()
+            root_win.withdraw()
+            root_win.attributes("-topmost", True)
+            try:
+                if str(multiple).lower() in ("1", "true", "yes"):
+                    picked = filedialog.askopenfilenames(title=title, parent=root_win)
+                    picked = list(picked) if picked else []
+                else:
+                    one = filedialog.askopenfilename(title=title, parent=root_win)
+                    picked = [one] if one else []
+            finally:
+                try:
+                    root_win.destroy()
+                except Exception:
+                    pass
+            return {"paths": [str(Path(pth).resolve()) for pth in picked]}
+
+        return await loop.run_in_executor(None, _open_dialog)
 
     @app.post("/api/run")
     async def run_script(
         script: str = Form(...),
         args_json: str = Form("[]"),
-        file_ids: str = Form(""),
+        file_paths: str = Form(""),
         root: str = Form(""),
     ):
         scan_root = Path(root).resolve() if root else project_root
@@ -567,27 +687,35 @@ def create_app(
         except Exception:
             pass
 
-        if file_ids:
+        if file_paths:
             file_param = "filepath"
             for p in meta.params:
                 if any(kw in p.name.lower() for kw in ("file", "path", "upload")):
                     file_param = p.name
                     break
-            file_paths = []
-            for fid in file_ids.split(","):
-                fid = fid.strip()
-                if fid:
-                    fpath = uploads / fid
-                    if fpath.exists():
-                        file_paths.append(str(fpath))
-            if file_paths:
-                cmd.extend([f"--{file_param}"] + file_paths)
-                parsed_args[file_param] = file_paths[0] if len(file_paths) == 1 else file_paths
+            resolved_paths = []
+            # 用 "|" 分隔可避免 Windows 路径中的逗号问题。
+            for raw in file_paths.split("|"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                fpath = Path(raw)
+                if fpath.exists():
+                    resolved_paths.append(str(fpath.resolve()))
+            if resolved_paths:
+                cmd.extend([f"--{file_param}"] + resolved_paths)
+                parsed_args[file_param] = resolved_paths[0] if len(resolved_paths) == 1 else resolved_paths
 
         if on_run:
             on_run(script, cmd)
 
-        async def stream_output():
+        # 每次运行分配一个 session id, 供 /api/input 定位目标脚本 stdin。
+        import queue as _queue_mod
+        sid = uuid.uuid4().hex
+        stdin_q = _queue_mod.Queue()
+        _RUN_SESSIONS[sid] = {"stdin_q": stdin_q, "proc": None}
+
+        async def _core():
             if getattr(sys, "frozen", False) or meta.task:
                 # In-process execution:
                 #   - frozen exe (avoids spawning a nested Python) or
@@ -596,13 +724,13 @@ def create_app(
                     script_path = scripts_dir_ / meta.path
                     exit_code = 0
                     if meta.task:
-                        stream = _run_task_stream(script_path, meta.task, parsed_args)
+                        stream = _run_task_stream(script_path, meta.task, parsed_args, stdin_q=stdin_q)
                     else:
                         script_path_str = str(script_path)
                         extra_args = cmd[2:] if len(cmd) > 2 else []
                         if extra_args and extra_args[0] == script_path_str:
                             extra_args = extra_args[1:]
-                        stream = _run_script_stream(script_path, extra_args)
+                        stream = _run_script_stream(script_path, extra_args, stdin_q=stdin_q)
                     async for tag, value in stream:
                         if tag == "EXIT":
                             exit_code = value
@@ -612,12 +740,19 @@ def create_app(
                         yield f"data: [{tag}] {value}\n\n"
                     yield f"data: __EXIT__:{exit_code}\n\n"
                 except asyncio.CancelledError:
+                    try:
+                        stdin_q.put_nowait(None)  # 唤醒阻塞的 readline()
+                    except Exception:
+                        pass
                     yield "data: Cancelled\n\ndata: __EXIT__:1\n\n"
                 except Exception as e:
                     yield f"data: Error: {e}\n\ndata: __EXIT__:1\n\n"
             else:
+                proc = None
                 try:
-                    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+                    kwargs = {"stdin": subprocess.PIPE,
+                              "stdout": subprocess.PIPE,
+                              "stderr": subprocess.PIPE}
                     env = os.environ.copy()
                     env["PYTHONIOENCODING"] = "utf-8"
                     kwargs["env"] = env
@@ -626,16 +761,70 @@ def create_app(
                     elif sys.platform != "win32":
                         kwargs["preexec_fn"] = os.setpgrp
                     proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(scripts_dir_), **kwargs)
+                    _RUN_SESSIONS[sid]["proc"] = proc
                     encoding = "utf-8"
                     async for chunk in _merge_streams(proc.stdout, proc.stderr, encoding):
                         yield f"data: {chunk}\n\n"
                     await proc.wait()
                     yield f"data: __EXIT__:{proc.returncode}\n\n"
                 except asyncio.CancelledError:
+                    if proc is not None and proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
                     yield "data: Cancelled\n\ndata: __EXIT__:1\n\n"
                 except Exception as e:
                     yield f"data: Error: {e}\n\ndata: __EXIT__:1\n\n"
+
+        async def stream_output():
+            # 首帧发送 session id, 前端保存后即可通过 /api/input 发送 stdin。
+            yield f"data: __SID__:{sid}\n\n"
+            try:
+                async for chunk in _core():
+                    yield chunk
+            finally:
+                _RUN_SESSIONS.pop(sid, None)
+
         return StreamingResponse(stream_output(), media_type="text/event-stream")
+
+    @app.post("/api/input")
+    async def send_input(
+        session_id: str = Form(...),
+        text: str = Form(""),
+        eof: str = Form("0"),
+    ):
+        """向正在运行的脚本 stdin 投递用户输入。
+
+        - text 会自动补 \n (除非已带换行或为空)。
+        - eof="1" 时发送 EOF, 触发脚本里 sys.stdin 的 EOF。
+        """
+        sess = _RUN_SESSIONS.get(session_id)
+        if not sess:
+            return JSONResponse({"error": "unknown or finished session"}, 404)
+        payload = "" if not text else (text if text.endswith("\n") else text + "\n")
+        proc = sess.get("proc")
+        if proc is not None:
+            try:
+                if payload:
+                    proc.stdin.write(payload.encode("utf-8"))
+                    await proc.stdin.drain()
+                if str(eof).lower() in ("1", "true", "yes"):
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, 500)
+            return {"ok": True}
+        stdin_q = sess.get("stdin_q")
+        if stdin_q is not None:
+            if payload:
+                stdin_q.put(payload)
+            if str(eof).lower() in ("1", "true", "yes"):
+                stdin_q.put(None)
+            return {"ok": True}
+        return JSONResponse({"error": "session has no stdin channel"}, 400)
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
